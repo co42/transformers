@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import gc
+import hashlib
 import json
 import os
 import re
@@ -348,7 +349,7 @@ def load_sharded_checkpoint(model, folder, strict=True):
     return torch.nn.modules.module._IncompatibleKeys(missing_keys, unexpected_keys)
 
 
-def load_state_dict(checkpoint_file: Union[str, os.PathLike]):
+def load_state_dict(checkpoint_file: Union[str, os.PathLike], download=None):
     """
     Reads a PyTorch checkpoint file, returning properly formatted errors if they arise.
     """
@@ -369,11 +370,44 @@ def load_state_dict(checkpoint_file: Union[str, os.PathLike]):
                         "model. Make sure you have saved the model properly."
                     ) from e
         except (UnicodeDecodeError, ValueError):
-            raise OSError(
-                f"Unable to load weights from pytorch checkpoint file for '{checkpoint_file}' "
-                f"at '{checkpoint_file}'. "
-                "If you tried to load a PyTorch model from a TF 2.0 checkpoint, please set from_tf=True."
-            )
+            # Check sha256
+            def sha256(filename, block_size=4096 * 1024):
+                # Python program to find SHA256 hash string of a file
+
+                sha256_hash = hashlib.sha256()
+                with open(filename, "rb") as f:
+                    # Read and update hash string value in blocks of 4Mo
+                    for byte_block in iter(lambda: f.read(block_size), b""):
+                        sha256_hash.update(byte_block)
+
+                return sha256_hash.hexdigest()
+
+            actual_sha = sha256(checkpoint_file)
+            metafilename = f"{checkpoint_file}.json"
+            try:
+                with open(metafilename, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    # For some reason etag contains quotes, we just want the sha.
+                    expected_sha = data["etag"][1:-1]
+            except Exception:
+                expected_sha = None
+
+            if download and actual_sha != expected_sha:
+                logger.warning(
+                    f"Look like a corrupted file is on disk ({actual_sha}!={expected_sha}), attempting to recover by downloading again."
+                )
+
+                # Remove corrupted file
+                os.remove(checkpoint_file)
+                # Redownload file
+                checkpoint_file = download()
+                return torch.load(checkpoint_file, map_location="cpu")
+            else:
+                raise OSError(
+                    f"Unable to load weights from pytorch checkpoint file for '{checkpoint_file}' "
+                    f"at '{checkpoint_file}'. "
+                    "If you tried to load a PyTorch model from a TF 2.0 checkpoint, please set from_tf=True."
+                )
 
 
 def _load_state_dict_into_model(model_to_load, state_dict, start_prefix):
@@ -2015,12 +2049,24 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
                 mirror=mirror,
             )
 
+        def download():
+            return cached_path(
+                archive_file,
+                cache_dir=cache_dir,
+                force_download=force_download,
+                proxies=proxies,
+                resume_download=resume_download,
+                local_files_only=local_files_only,
+                use_auth_token=use_auth_token,
+                user_agent=user_agent,
+            )
+
         # load pt weights early so that we know which dtype to init the model under
         if from_pt:
             if not is_sharded and state_dict is None:
                 # Time to load the checkpoint
-                state_dict = load_state_dict(resolved_archive_file)
 
+                state_dict = load_state_dict(resolved_archive_file, download=download)
             # set dtype to instantiate the model under:
             # 1. If torch_dtype is not None, we use that dtype
             # 2. If torch_dtype is "auto", we auto-detect dtype from the loaded state_dict, by checking its first
@@ -2035,8 +2081,8 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
                         elif not is_sharded:
                             torch_dtype = get_state_dict_dtype(state_dict)
                         else:
-                            one_state_dict = load_state_dict(resolved_archive_file)
-                            torch_dtype = get_state_dict_dtype(one_state_dict)
+                            one_state_dict = load_state_dict(resolved_archive_file, download=download)
+                            torch_dtype = next(iter(one_state_dict.values())).dtype
                             del one_state_dict  # free CPU memory
                     else:
                         raise ValueError(
